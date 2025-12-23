@@ -1,0 +1,6 @@
+Add blutooth OTP sharing
+Add local OTP generation that is truly random
+
+Host a VPS for forwarding
+Remove the server option in launcher
+Streamline all the GUIs 
