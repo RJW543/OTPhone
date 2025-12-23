@@ -126,7 +126,7 @@ class EncryptionMethodSelector:
         # AES Button
         aes_button = tk.Button(
             button_frame,
-            text="AES (Advanced Encryption)",
+            text="AES",
             width=20,
             height=2,
             command=lambda: self.select_method("AES"),
