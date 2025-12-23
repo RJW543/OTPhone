@@ -1,0 +1,983 @@
+import tkinter as tk
+import tkinter.ttk as ttk
+from tkinter import messagebox, scrolledtext, filedialog
+import tkinter.simpledialog
+import socket
+import threading
+from pathlib import Path
+import fcntl
+import speech_recognition as sr
+import pyttsx3
+import base64
+import hashlib
+import json
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
+
+# Import Bluetooth module
+try:
+    from BluetoothOTPShare import BluetoothOTPServer, BluetoothOTPClient
+    BLUETOOTH_AVAILABLE = True
+except ImportError:
+    BLUETOOTH_AVAILABLE = False
+    print("Warning: Bluetooth module not available. Install pybluez to enable Bluetooth sharing.")
+
+
+def load_otp_pages(file_name="otp_cipher.txt"):
+    otp_pages = []
+    file_path = Path(file_name)
+    if not file_path.exists():
+        return otp_pages
+    with file_path.open("r") as file:
+        for line in file:
+            if len(line) < 8:
+                continue
+            identifier = line[:8]
+            content = line[8:].strip()
+            otp_pages.append((identifier, content))
+    return otp_pages
+
+def load_used_pages(file_name="used_pages.txt"):
+    file_path = Path(file_name)
+    if not file_path.exists():
+        return set()
+    with file_path.open("r") as file:
+        return {line.strip() for line in file}
+
+def save_used_page(identifier, file_name="used_pages.txt"):
+    with open(file_name, "a") as file:
+        file.write(f"{identifier}\n")
+
+def get_next_otp_page_linux(otp_pages, used_identifiers, lock_file="used_pages.lock"):
+    """Find the next unused OTP page based on identifiers with a locking mechanism on Linux."""
+    with open(lock_file, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for identifier, content in otp_pages:
+            if identifier not in used_identifiers:
+                save_used_page(identifier)
+                used_identifiers.add(identifier)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                return identifier, content
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    return None, None
+
+def encrypt_message(message, otp_content):
+    encrypted_message = []
+    for i, char in enumerate(message):
+        if i >= len(otp_content):
+            break
+        encrypted_char = chr(ord(char) ^ ord(otp_content[i]))
+        encrypted_message.append(encrypted_char)
+    return ''.join(encrypted_message)
+
+def decrypt_message(encrypted_message, otp_content):
+    decrypted_message = []
+    for i, char in enumerate(encrypted_message):
+        if i >= len(otp_content):
+            break
+        decrypted_char = chr(ord(char) ^ ord(otp_content[i]))
+        decrypted_message.append(decrypted_char)
+    return ''.join(decrypted_message)
+
+
+# AES Encryption/Decryption Functions
+def aes_encrypt(message, key):
+    """Encrypt a message using AES-256 in CBC mode."""
+    cipher = AES.new(key, AES.MODE_CBC)
+    ct_bytes = cipher.encrypt(pad(message.encode('utf-8'), AES.block_size))
+    iv = base64.b64encode(cipher.iv).decode('utf-8')
+    ct = base64.b64encode(ct_bytes).decode('utf-8')
+    return iv + ':' + ct
+
+def aes_decrypt(encrypted_message, key):
+    """Decrypt a message using AES-256 in CBC mode."""
+    try:
+        iv, ct = encrypted_message.split(':')
+        iv = base64.b64decode(iv)
+        ct = base64.b64decode(ct)
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        pt = unpad(cipher.decrypt(ct), AES.block_size)
+        return pt.decode('utf-8')
+    except Exception as e:
+        raise ValueError(f"Decryption failed: {e}")
+
+
+class EncryptionMethodSelector:
+    """Initial screen to select encryption method before launching the main client."""
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Select Encryption Method")
+        self.master.geometry("400x300")
+        self.master.resizable(False, False)
+        
+        self.selected_method = None
+        
+        # Title
+        title_label = tk.Label(
+            self.master, 
+            text="Choose Encryption Method", 
+            font=("Arial", 16, "bold")
+        )
+        title_label.pack(pady=20)
+        
+        # Description
+        desc_label = tk.Label(
+            self.master,
+            text="Select the encryption method you want to use:",
+            font=("Arial", 10)
+        )
+        desc_label.pack(pady=10)
+        
+        # Button frame
+        button_frame = tk.Frame(self.master)
+        button_frame.pack(pady=20)
+        
+        # OTP Button
+        otp_button = tk.Button(
+            button_frame,
+            text="OTP (One-Time Pad)",
+            width=20,
+            height=2,
+            command=lambda: self.select_method("OTP"),
+            bg="#4CAF50",
+            fg="white",
+            font=("Arial", 11, "bold")
+        )
+        otp_button.pack(pady=5)
+        
+        # OTP Lite Button
+        otp_lite_button = tk.Button(
+            button_frame,
+            text="OTP Lite",
+            width=20,
+            height=2,
+            command=lambda: self.select_method("OTP Lite"),
+            bg="#2196F3",
+            fg="white",
+            font=("Arial", 11, "bold")
+        )
+        otp_lite_button.pack(pady=5)
+        
+        # AES Button
+        aes_button = tk.Button(
+            button_frame,
+            text="AES (Advanced Encryption)",
+            width=20,
+            height=2,
+            command=lambda: self.select_method("AES"),
+            bg="#FF9800",
+            fg="white",
+            font=("Arial", 11, "bold")
+        )
+        aes_button.pack(pady=5)
+        
+    def select_method(self, method):
+        """Handle encryption method selection."""
+        self.selected_method = method
+        
+        if method == "OTP":
+            # Proceed to the main OTP client
+            self.master.destroy()
+            root = tk.Tk()
+            show_disclaimer()
+            client_app = OTPClient(root)
+            root.mainloop()
+        elif method == "OTP Lite":
+            # Not yet implemented
+            messagebox.showinfo(
+                "Not Implemented", 
+                "OTP Lite encryption is not yet implemented.\n\nThis feature will be available in a future update."
+            )
+        elif method == "AES":
+            # Proceed to the AES client
+            self.master.destroy()
+            root = tk.Tk()
+            show_disclaimer()
+            client_app = AESClient(root)
+            root.mainloop()
+
+
+#AESClient class with automatic key exchange
+class AESClient:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("AES Messaging Client")
+
+        self.master.geometry("700x600")
+        self.master.minsize(600, 500)
+
+        style = ttk.Style()
+        style.theme_use('clam') 
+
+        menu_bar = tk.Menu(self.master)
+        self.master.config(menu=menu_bar)
+
+        file_menu = tk.Menu(menu_bar, tearoff=False)
+        file_menu.add_command(label="About", command=self.show_about_info)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.master.quit)
+        menu_bar.add_cascade(label="File", menu=file_menu)
+
+        self.user_id_file = Path("user_id_aes.txt")
+        self.user_id = self.load_or_prompt_user_id()
+
+        # Dictionary to store AES keys for each recipient
+        self.aes_keys = {}  # {recipient_id: key}
+
+        self.SERVER_HOST = None
+        self.SERVER_PORT = None
+        self.client_socket = None
+
+        self.chat_history_file = Path(f"chat_history_aes_{self.user_id}.txt") if self.user_id else None
+
+        self.main_frame = ttk.Frame(self.master, padding="10 10 10 10")
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
+        self.master.rowconfigure(0, weight=1)
+        self.master.columnconfigure(0, weight=1)
+
+        self.server_frame = ttk.Frame(self.main_frame, padding=(0, 10, 0, 10))
+        self.server_frame.grid(row=0, column=0, sticky="ew")
+
+        self.user_id_frame = ttk.Frame(self.main_frame, padding=(0, 10, 0, 10))
+        self.user_id_frame.grid(row=1, column=0, sticky="ew")
+
+        self.message_frame = ttk.Frame(self.main_frame)
+        self.message_frame.grid(row=2, column=0, sticky="nsew")
+
+        self.main_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(self.server_frame, text="Ngrok Host:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.ngrok_host_entry = ttk.Entry(self.server_frame, width=20)
+        self.ngrok_host_entry.insert(0, "0.tcp.ngrok.io")
+        self.ngrok_host_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(self.server_frame, text="Ngrok Port:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.ngrok_port_entry = ttk.Entry(self.server_frame, width=10)
+        self.ngrok_port_entry.insert(0, "12345")
+        self.ngrok_port_entry.grid(row=0, column=3, padx=5, pady=5)
+
+        self.set_server_button = ttk.Button(self.server_frame, text="Set Server Address", command=self.set_server_address)
+        self.set_server_button.grid(row=0, column=4, padx=10, pady=5)
+
+        ttk.Label(self.user_id_frame, text="Your userID:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.user_id_entry = ttk.Entry(self.user_id_frame, width=30)
+        self.user_id_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        if self.user_id:
+            self.user_id_entry.insert(0, self.user_id)
+
+        self.connect_button = ttk.Button(self.user_id_frame, text="Connect", command=self.connect_to_server)
+        self.connect_button.grid(row=0, column=2, padx=10, pady=5)
+
+        self.user_id_display = ttk.Label(self.message_frame, text="", style="Bold.TLabel")
+        self.user_id_display.grid(row=0, column=0, columnspan=3, padx=5, pady=5, sticky="ew")
+
+        self.chat_area = scrolledtext.ScrolledText(self.message_frame, width=60, height=15, state=tk.DISABLED)
+        self.chat_area.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
+        self.message_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(self.message_frame, text="Recipient userID:").grid(row=2, column=0, padx=5, sticky="e")
+        self.recipient_input = ttk.Entry(self.message_frame, width=40)
+        self.recipient_input.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+
+        ttk.Label(self.message_frame, text="Message:").grid(row=3, column=0, padx=5, sticky="e")
+        self.text_input = ttk.Entry(self.message_frame, width=40)
+        self.text_input.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+
+        self.send_button = ttk.Button(self.message_frame, text="Send Text Message", command=self.send_message)
+        self.send_button.grid(row=4, column=0, padx=5, pady=5, sticky="e")
+
+        self.record_button = ttk.Button(self.message_frame, text="Record Voice Message", command=self.send_voice_message)
+        self.record_button.grid(row=4, column=1, padx=5, pady=5, sticky="w")
+
+        for child in self.message_frame.winfo_children():
+            child.grid_remove()
+
+    def show_about_info(self):
+        messagebox.showinfo("About", "AES Messaging Client\nVersion 1.5\nAutomatic Key Exchange via Server.")
+
+    def load_or_prompt_user_id(self):
+        if self.user_id_file.exists():
+            existing = self.user_id_file.read_text().strip()
+            if existing:
+                return existing
+        return None
+
+    def save_user_id_to_file(self, user_id):
+        with self.user_id_file.open("w") as f:
+            f.write(user_id)
+
+    def set_server_address(self):
+        host = self.ngrok_host_entry.get().strip()
+        port = self.ngrok_port_entry.get().strip()
+        if not host or not port:
+            messagebox.showwarning("Warning", "Please enter both Ngrok host and port.")
+            return
+        try:
+            port = int(port)
+            self.SERVER_HOST = host
+            self.SERVER_PORT = port
+            messagebox.showinfo("Info", f"Server address set to {host}:{port}")
+        except ValueError:
+            messagebox.showerror("Error", "Port must be an integer.")
+
+    def connect_to_server(self):
+        if not self.SERVER_HOST or not self.SERVER_PORT:
+            messagebox.showwarning("Warning", "Please set the server address first.")
+            return
+
+        user_id = self.user_id_entry.get().strip()
+        if not user_id:
+            messagebox.showwarning("Warning", "Please enter your userID.")
+            return
+
+        self.user_id = user_id
+        self.save_user_id_to_file(self.user_id)
+
+        self.chat_history_file = Path(f"chat_history_aes_{self.user_id}.txt")
+
+        try:
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.connect((self.SERVER_HOST, self.SERVER_PORT))
+            
+            # Send user ID with AES mode indicator
+            self.client_socket.sendall(f"AES:{self.user_id}".encode("utf-8"))
+            response = self.client_socket.recv(1024).decode("utf-8")
+
+            if response in ["UserID already taken. Connection closed.", "Invalid userID. Connection closed."]:
+                messagebox.showerror("Error", response)
+                self.client_socket.close()
+                return
+
+            messagebox.showinfo("Info", "Connected to the server with AES encryption (automatic key exchange).")
+
+            for child in self.user_id_frame.winfo_children():
+                child.grid_remove()
+            for child in self.message_frame.winfo_children():
+                child.grid()
+
+            self.user_id_display.config(text=f"Your userID: {self.user_id} (AES Encrypted - Auto Key Exchange)")
+
+            self.load_chat_history()
+
+            receive_thread = threading.Thread(target=self.receive_messages, daemon=True)
+            receive_thread.start()
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to connect to the server: {e}")
+
+    def load_chat_history(self):
+        if self.chat_history_file and self.chat_history_file.exists():
+            with self.chat_history_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    self.update_chat_area(line.strip(), save_to_file=False)
+
+    def save_chat_line(self, message):
+        if self.chat_history_file:
+            with self.chat_history_file.open("a", encoding="utf-8") as f:
+                f.write(message + "\n")
+
+    def request_key_for_recipient(self, recipient_id):
+        """Request an AES key from the server for a specific recipient."""
+        try:
+            # Send key request to server
+            key_request = json.dumps({
+                "type": "KEY_REQUEST",
+                "recipient": recipient_id
+            })
+            self.client_socket.sendall(f"AESKEY:{key_request}".encode("utf-8"))
+            
+            # Wait for key response (this will be handled in receive_messages)
+            self.update_chat_area(f"Requesting encryption key for {recipient_id}...")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to request key: {e}")
+
+    def send_message(self):
+        recipient_id = self.recipient_input.get().strip()
+        message = self.text_input.get()
+
+        if not recipient_id:
+            messagebox.showwarning("Warning", "Please enter a valid recipient userID.")
+            return
+        if not message:
+            messagebox.showwarning("Warning", "Please enter a message.")
+            return
+        if recipient_id == self.user_id:
+            messagebox.showwarning("Warning", "You cannot send a message to yourself.")
+            return
+
+        # Check if we have a key for this recipient
+        if recipient_id not in self.aes_keys:
+            # Request key from server
+            self.request_key_for_recipient(recipient_id)
+            messagebox.showinfo("Info", f"Requesting encryption key for {recipient_id}. Please try sending again in a moment.")
+            return
+
+        # Encrypt the message using the stored AES key
+        aes_key = self.aes_keys[recipient_id]
+        encrypted_message = aes_encrypt(message, aes_key)
+        full_message = f"{recipient_id}|AESDATA:{encrypted_message}"
+        
+        if self.client_socket:
+            try:
+                self.client_socket.sendall(full_message.encode("utf-8"))
+                self.text_input.delete(0, tk.END)
+                display_line = f"Me to {recipient_id}: {message}"
+                self.update_chat_area(display_line)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to send message: {e}")
+
+    def receive_messages(self):
+        while True:
+            try:
+                if self.client_socket:
+                    data = self.client_socket.recv(4096)
+                    if not data:
+                        break
+                    message = data.decode("utf-8")
+                    
+                    # Handle key exchange messages
+                    if message.startswith("KEYEXCHANGE:"):
+                        key_data = json.loads(message[12:])
+                        recipient_id = key_data["recipient"]
+                        key_hex = key_data["key"]
+                        
+                        # Store the key
+                        self.aes_keys[recipient_id] = bytes.fromhex(key_hex)
+                        self.update_chat_area(f"✓ Encryption key established with {recipient_id}")
+                        continue
+                    
+                    try:
+                        # Parse the received message into sender ID and payload
+                        sender_id, payload = message.split("|", 1)
+                        
+                        # Check if it's an AES data message
+                        if payload.startswith("AESDATA:"):
+                            encrypted_message = payload[8:]  # Remove "AESDATA:" prefix
+                            
+                            # Check if we have a key for this sender
+                            if sender_id not in self.aes_keys:
+                                # Request key from server
+                                self.request_key_for_recipient(sender_id)
+                                self.update_chat_area(f"Received encrypted message from {sender_id}, requesting key...")
+                                continue
+                            
+                            try:
+                                # Decrypt the message using the stored AES key
+                                aes_key = self.aes_keys[sender_id]
+                                decrypted_message = aes_decrypt(encrypted_message, aes_key)
+                                display_line = f"Received from {sender_id} (AES Decrypted): {decrypted_message}"
+                                self.update_chat_area(display_line)
+                                # Use a separate thread to speak the decrypted message
+                                threading.Thread(target=self.speak_text, args=(decrypted_message,), daemon=True).start()
+                            except ValueError as e:
+                                # Decryption failed
+                                display_line = f"Received from {sender_id} (Decryption Failed): {str(e)}"
+                                self.update_chat_area(display_line)
+                        else:
+                            # Unknown message format
+                            display_line = f"Received from {sender_id} (Unknown Format): {payload}"
+                            self.update_chat_area(display_line)
+                    except ValueError:
+                        # Handle improperly formatted messages
+                        self.update_chat_area("Received an improperly formatted message.")
+            except Exception as e:
+                # Log any errors that occur during message reception
+                print(f"Error receiving message: {e}")
+                break
+                
+        # Close the client socket if it is still open
+        if self.client_socket:
+            self.client_socket.close()
+        # Notify the user that the connection has been disconnected
+        messagebox.showwarning("Warning", "Disconnected from the server.")
+        self.master.quit()
+
+    def update_chat_area(self, message, save_to_file=True):
+        self.chat_area.config(state=tk.NORMAL)
+        self.chat_area.insert(tk.END, message + "\n")
+        self.chat_area.config(state=tk.DISABLED)
+        self.chat_area.yview(tk.END)
+
+        if save_to_file:
+            self.save_chat_line(message)
+
+    def record_voice_message(self):
+        r = sr.Recognizer()
+        mic = sr.Microphone()
+        try:
+            with mic as source:
+                self.update_chat_area("Adjusting for ambient noise... Please wait.")
+                r.adjust_for_ambient_noise(source)
+                self.update_chat_area("Recording voice message... Please speak.")
+                audio = r.listen(source)
+            try:
+                transcription = r.recognize_google(audio)
+                self.update_chat_area("Voice message transcribed: " + transcription)
+                return transcription
+            except sr.UnknownValueError:
+                self.update_chat_area("Could not understand the voice message.")
+                return ""
+            except sr.RequestError as e:
+                self.update_chat_area("Error with transcription service.")
+                return ""
+        except Exception as e:
+            self.update_chat_area("Error recording voice message: " + str(e))
+            return ""
+
+    def send_voice_message(self):
+        transcription = self.record_voice_message()
+        if transcription:
+            self.text_input.delete(0, tk.END)
+            self.text_input.insert(0, transcription)
+            self.send_message()
+
+    def speak_text(self, text):
+        engine = pyttsx3.init()
+        engine.say(text)
+        engine.runAndWait()
+
+
+#OTPClient class with Bluetooth sharing
+class OTPClient:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("OTP Messaging Client")
+
+        self.master.geometry("700x600")
+        self.master.minsize(600, 500)
+
+        style = ttk.Style()
+        style.theme_use('clam') 
+
+        menu_bar = tk.Menu(self.master)
+        self.master.config(menu=menu_bar)
+
+        file_menu = tk.Menu(menu_bar, tearoff=False)
+        file_menu.add_command(label="About", command=self.show_about_info)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.master.quit)
+        menu_bar.add_cascade(label="File", menu=file_menu)
+        
+        # Bluetooth menu for OTP sharing
+        if BLUETOOTH_AVAILABLE:
+            bluetooth_menu = tk.Menu(menu_bar, tearoff=False)
+            bluetooth_menu.add_command(label="Send OTP via Bluetooth", command=self.send_otp_bluetooth)
+            bluetooth_menu.add_command(label="Receive OTP via Bluetooth", command=self.receive_otp_bluetooth)
+            bluetooth_menu.add_separator()
+            bluetooth_menu.add_command(label="Stop Bluetooth Server", command=self.stop_bluetooth_server)
+            menu_bar.add_cascade(label="Bluetooth", menu=bluetooth_menu)
+        
+        # Bluetooth server instance
+        self.bt_server = None
+
+        self.user_id_file = Path("user_id.txt")
+        self.user_id = self.load_or_prompt_user_id()
+
+        self.otp_pages = load_otp_pages()
+        self.used_identifiers = load_used_pages()
+
+        self.SERVER_HOST = None
+        self.SERVER_PORT = None
+        self.client_socket = None
+
+        self.chat_history_file = Path(f"chat_history_{self.user_id}.txt") if self.user_id else None
+
+        self.main_frame = ttk.Frame(self.master, padding="10 10 10 10")
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
+        self.master.rowconfigure(0, weight=1)
+        self.master.columnconfigure(0, weight=1)
+
+        self.server_frame = ttk.Frame(self.main_frame, padding=(0, 10, 0, 10))
+        self.server_frame.grid(row=0, column=0, sticky="ew")
+
+        self.user_id_frame = ttk.Frame(self.main_frame, padding=(0, 10, 0, 10))
+        self.user_id_frame.grid(row=1, column=0, sticky="ew")
+
+        self.message_frame = ttk.Frame(self.main_frame)
+        self.message_frame.grid(row=2, column=0, sticky="nsew")
+
+        self.main_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(self.server_frame, text="Ngrok Host:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.ngrok_host_entry = ttk.Entry(self.server_frame, width=20)
+        self.ngrok_host_entry.insert(0, "0.tcp.ngrok.io")
+        self.ngrok_host_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(self.server_frame, text="Ngrok Port:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.ngrok_port_entry = ttk.Entry(self.server_frame, width=10)
+        self.ngrok_port_entry.insert(0, "12345")
+        self.ngrok_port_entry.grid(row=0, column=3, padx=5, pady=5)
+
+        self.set_server_button = ttk.Button(self.server_frame, text="Set Server Address", command=self.set_server_address)
+        self.set_server_button.grid(row=0, column=4, padx=10, pady=5)
+
+        ttk.Label(self.user_id_frame, text="Your userID:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.user_id_entry = ttk.Entry(self.user_id_frame, width=30)
+        self.user_id_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        if self.user_id:
+            self.user_id_entry.insert(0, self.user_id)
+
+        self.connect_button = ttk.Button(self.user_id_frame, text="Connect", command=self.connect_to_server)
+        self.connect_button.grid(row=0, column=2, padx=10, pady=5)
+
+        self.user_id_display = ttk.Label(self.message_frame, text="", style="Bold.TLabel")
+        self.user_id_display.grid(row=0, column=0, columnspan=3, padx=5, pady=5, sticky="ew")
+
+        self.chat_area = scrolledtext.ScrolledText(self.message_frame, width=60, height=15, state=tk.DISABLED)
+        self.chat_area.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
+        self.message_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(self.message_frame, text="Recipient userID:").grid(row=2, column=0, padx=5, sticky="e")
+        self.recipient_input = ttk.Entry(self.message_frame, width=40)
+        self.recipient_input.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+
+        ttk.Label(self.message_frame, text="Message:").grid(row=3, column=0, padx=5, sticky="e")
+        self.text_input = ttk.Entry(self.message_frame, width=40)
+        self.text_input.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+
+        self.send_button = ttk.Button(self.message_frame, text="Send Text Message", command=self.send_message)
+        self.send_button.grid(row=4, column=0, padx=5, pady=5, sticky="e")
+
+        self.record_button = ttk.Button(self.message_frame, text="Record Voice Message", command=self.send_voice_message)
+        self.record_button.grid(row=4, column=1, padx=5, pady=5, sticky="w")
+
+        for child in self.message_frame.winfo_children():
+            child.grid_remove()
+
+    def show_about_info(self):
+        messagebox.showinfo("About", "OTP Messaging Client\nVersion 1.5\nWith Bluetooth OTP Sharing.")
+    
+    # Bluetooth OTP Sharing Methods
+    def send_otp_bluetooth(self):
+        """Send OTP file via Bluetooth to another device."""
+        if not BLUETOOTH_AVAILABLE:
+            messagebox.showerror("Error", "Bluetooth module not available. Install pybluez:\npip install pybluez")
+            return
+        
+        # Ask user which OTP file to send
+        file_path = filedialog.askopenfilename(
+            title="Select OTP file to send",
+            initialdir=".",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        
+        if not file_path:
+            return
+        
+        # Create a window to show Bluetooth status
+        bt_window = tk.Toplevel(self.master)
+        bt_window.title("Bluetooth OTP Transfer")
+        bt_window.geometry("500x400")
+        
+        status_text = scrolledtext.ScrolledText(bt_window, width=60, height=20, state=tk.DISABLED)
+        status_text.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        
+        def log_status(message):
+            status_text.config(state=tk.NORMAL)
+            status_text.insert(tk.END, message + "\n")
+            status_text.config(state=tk.DISABLED)
+            status_text.yview(tk.END)
+        
+        def do_transfer():
+            client = BluetoothOTPClient(callback=log_status)
+            devices = client.discover_devices(duration=8)
+            
+            if not devices:
+                return
+            
+            # Create device selection dialog
+            log_status("\n=== Select Device ===")
+            for i, (addr, name) in enumerate(devices):
+                log_status(f"{i+1}. {name} ({addr})")
+            
+            # Ask user to select device
+            bt_window.lift()
+            device_num = tk.simpledialog.askinteger(
+                "Select Device",
+                f"Enter device number (1-{len(devices)}):",
+                parent=bt_window,
+                minvalue=1,
+                maxvalue=len(devices)
+            )
+            
+            if device_num:
+                device_address = devices[device_num - 1][0]
+                client.send_file(device_address, file_path)
+        
+        transfer_thread = threading.Thread(target=do_transfer, daemon=True)
+        transfer_thread.start()
+    
+    def receive_otp_bluetooth(self):
+        """Start Bluetooth server to receive OTP files."""
+        if not BLUETOOTH_AVAILABLE:
+            messagebox.showerror("Error", "Bluetooth module not available. Install pybluez:\npip install pybluez")
+            return
+        
+        if self.bt_server and self.bt_server.running:
+            messagebox.showinfo("Info", "Bluetooth server is already running.")
+            return
+        
+        # Create a window to show Bluetooth status
+        bt_window = tk.Toplevel(self.master)
+        bt_window.title("Bluetooth OTP Receiver")
+        bt_window.geometry("500x400")
+        
+        status_text = scrolledtext.ScrolledText(bt_window, width=60, height=20, state=tk.DISABLED)
+        status_text.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        
+        def log_status(message):
+            status_text.config(state=tk.NORMAL)
+            status_text.insert(tk.END, message + "\n")
+            status_text.config(state=tk.DISABLED)
+            status_text.yview(tk.END)
+            
+            # If file received successfully, reload OTP pages
+            if "File received successfully" in message:
+                self.otp_pages = load_otp_pages()
+                self.used_identifiers = load_used_pages()
+                log_status("✓ OTP pages reloaded!")
+        
+        self.bt_server = BluetoothOTPServer(callback=log_status)
+        self.bt_server.start_server()
+        
+        # Button to stop server
+        stop_button = tk.Button(
+            bt_window,
+            text="Stop Server",
+            command=lambda: [self.stop_bluetooth_server(), bt_window.destroy()]
+        )
+        stop_button.pack(pady=5)
+    
+    def stop_bluetooth_server(self):
+        """Stop the Bluetooth server."""
+        if self.bt_server:
+            self.bt_server.stop_server()
+            self.bt_server = None
+            messagebox.showinfo("Info", "Bluetooth server stopped.")
+        else:
+            messagebox.showinfo("Info", "Bluetooth server is not running.")
+
+    def load_or_prompt_user_id(self):
+        if self.user_id_file.exists():
+            existing = self.user_id_file.read_text().strip()
+            if existing:
+                return existing
+        return None
+
+    def save_user_id_to_file(self, user_id):
+        with self.user_id_file.open("w") as f:
+            f.write(user_id)
+
+    def set_server_address(self):
+        host = self.ngrok_host_entry.get().strip()
+        port = self.ngrok_port_entry.get().strip()
+        if not host or not port:
+            messagebox.showwarning("Warning", "Please enter both Ngrok host and port.")
+            return
+        try:
+            port = int(port)
+            self.SERVER_HOST = host
+            self.SERVER_PORT = port
+            messagebox.showinfo("Info", f"Server address set to {host}:{port}")
+        except ValueError:
+            messagebox.showerror("Error", "Port must be an integer.")
+
+    def connect_to_server(self):
+        if not self.SERVER_HOST or not self.SERVER_PORT:
+            messagebox.showwarning("Warning", "Please set the server address first.")
+            return
+
+        user_id = self.user_id_entry.get().strip()
+        if not user_id:
+            messagebox.showwarning("Warning", "Please enter your userID.")
+            return
+
+        self.user_id = user_id
+        self.save_user_id_to_file(self.user_id)
+
+        self.chat_history_file = Path(f"chat_history_{self.user_id}.txt")
+
+        try:
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.connect((self.SERVER_HOST, self.SERVER_PORT))
+            self.client_socket.sendall(self.user_id.encode("utf-8"))
+            response = self.client_socket.recv(1024).decode("utf-8")
+
+            if response in ["UserID already taken. Connection closed.", "Invalid userID. Connection closed."]:
+                messagebox.showerror("Error", response)
+                self.client_socket.close()
+                return
+
+            messagebox.showinfo("Info", "Connected to the server.")
+
+            for child in self.user_id_frame.winfo_children():
+                child.grid_remove()
+            for child in self.message_frame.winfo_children():
+                child.grid()
+
+            self.user_id_display.config(text=f"Your userID: {self.user_id}")
+
+            self.load_chat_history()
+
+            receive_thread = threading.Thread(target=self.receive_messages, daemon=True)
+            receive_thread.start()
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to connect to the server: {e}")
+
+    def load_chat_history(self):
+        if self.chat_history_file and self.chat_history_file.exists():
+            with self.chat_history_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    self.update_chat_area(line.strip(), save_to_file=False)
+
+    def save_chat_line(self, message):
+        if self.chat_history_file:
+            with self.chat_history_file.open("a", encoding="utf-8") as f:
+                f.write(message + "\n")
+
+    def get_next_available_otp(self):
+        return get_next_otp_page_linux(self.otp_pages, self.used_identifiers)
+
+    def send_message(self):
+        recipient_id = self.recipient_input.get().strip()
+        message = self.text_input.get()
+
+        if not recipient_id:
+            messagebox.showwarning("Warning", "Please enter a valid recipient userID.")
+            return
+        if not message:
+            messagebox.showwarning("Warning", "Please enter a message.")
+            return
+        if recipient_id == self.user_id:
+            messagebox.showwarning("Warning", "You cannot send a message to yourself.")
+            return
+
+        otp_identifier, otp_content = self.get_next_available_otp()
+        if otp_identifier and otp_content:
+            encrypted_message = encrypt_message(message, otp_content)
+            full_message = f"{recipient_id}|{otp_identifier}:{encrypted_message}"
+            if self.client_socket:
+                try:
+                    self.client_socket.sendall(full_message.encode("utf-8"))
+                    self.text_input.delete(0, tk.END)
+                    display_line = f"Me to {recipient_id}: {message}"
+                    self.update_chat_area(display_line)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to send message: {e}")
+        else:
+            messagebox.showerror("Error", "No available OTP pages to use.")
+
+    def receive_messages(self):
+        while True:
+            try:
+                 #Check if the client socket is active and receive data
+                if self.client_socket:
+                    data = self.client_socket.recv(4096)
+                    if not data: #If no data is received, exit the loop
+                        break
+                    message = data.decode("utf-8") #Decode the received message
+                    try:
+                        #Parse the received message into sender ID and payload
+                        sender_id, payload = message.split("|", 1)
+                        otp_identifier, actual_encrypted_message = payload.split(":", 1)
+
+                        #Search for the OTP content corresponding to the identifier
+                        otp_content = None
+                        for identifier, content in self.otp_pages:
+                            if identifier == otp_identifier:
+                                otp_content = content
+                                break
+
+                        if otp_content:
+                            #Decrypt the message using the OTP content
+                            decrypted_message = decrypt_message(actual_encrypted_message, otp_content)
+                            display_line = f"Received from {sender_id} (Decrypted): {decrypted_message}"
+                            self.update_chat_area(display_line)
+                            #Use a separate thread to speak the decrypted message
+                            threading.Thread(target=self.speak_text, args=(decrypted_message,), daemon=True).start()
+                            #Mark the OTP page as used and save it
+                            save_used_page(otp_identifier)
+                            self.used_identifiers.add(otp_identifier)
+                        else:
+                            #Handle case where OTP identifier is unknown
+                            display_line = f"Received from {sender_id} (Unknown OTP): {actual_encrypted_message}"
+                            self.update_chat_area(display_line)
+                    except ValueError:
+                        #Handle improperly formatted messages
+                        self.update_chat_area("Received an improperly formatted message.")
+            except Exception as e:
+                #Log any errors that occur during message reception
+                print(f"Error receiving message: {e}")
+                break
+                
+        #Close the client socket if it is still open
+        if self.client_socket:
+            self.client_socket.close()
+        #Notify the user that the connection has been disconnected
+        messagebox.showwarning("Warning", "Disconnected from the server.")
+        self.master.quit()
+
+    def update_chat_area(self, message, save_to_file=True):
+        self.chat_area.config(state=tk.NORMAL)
+        self.chat_area.insert(tk.END, message + "\n")
+        self.chat_area.config(state=tk.DISABLED)
+        self.chat_area.yview(tk.END)
+
+        if save_to_file:
+            self.save_chat_line(message)
+
+    def record_voice_message(self):
+        r = sr.Recognizer()
+        mic = sr.Microphone()
+        try:
+            with mic as source:
+                self.update_chat_area("Adjusting for ambient noise... Please wait.")
+                r.adjust_for_ambient_noise(source)
+                self.update_chat_area("Recording voice message... Please speak.")
+                audio = r.listen(source)
+            try:
+                transcription = r.recognize_google(audio)
+                self.update_chat_area("Voice message transcribed: " + transcription)
+                return transcription
+            except sr.UnknownValueError:
+                self.update_chat_area("Could not understand the voice message.")
+                return ""
+            except sr.RequestError as e:
+                self.update_chat_area("Error with transcription service.")
+                return ""
+        except Exception as e:
+            self.update_chat_area("Error recording voice message: " + str(e))
+            return ""
+
+    def send_voice_message(self):
+        transcription = self.record_voice_message()
+        if transcription:
+            self.text_input.delete(0, tk.END)
+            self.text_input.insert(0, transcription)
+            self.send_message()
+
+    def speak_text(self, text):
+        engine = pyttsx3.init()
+        engine.say(text)
+        engine.runAndWait()
+
+
+def show_disclaimer():
+    disclaimer_text = (
+        "DISCLAIMER:\n\n"
+        "This software is intended for educational and lawful use only. "
+        "Any misuse of this encryption technology for illegal or unethical purposes is strongly discouraged. "
+        "Users are responsible for complying with all applicable laws and regulations in their jurisdiction."
+    )
+    messagebox.showinfo("Disclaimer", disclaimer_text)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    selector = EncryptionMethodSelector(root)
+    root.mainloop()
