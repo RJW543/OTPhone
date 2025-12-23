@@ -5,130 +5,7 @@ import socket
 import socketserver
 from pyngrok import ngrok
 
-# --- v1.5 additions: AES + OTP-Lite protocol support ---
-import json
-import base64
-import secrets
-
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-clients = {}
-
-# Stores per-user public keys for server-assisted OTP-Lite delivery.
-# Keys are registered by the client after connecting.
-client_rsa_pubs = {}  # user_id -> cryptography public key
-
-SERVER_USER_ID = "__server__"
-MAX_OTPLITE_LEN = 1024  # bytes; keeps messages within a single TCP recv() in this simple demo
-
-
-def _safe_json_loads(s: str):
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-
-def _send_system_message(target_user_id: str, payload: dict):
-    """Send a server-originated JSON payload to a connected client."""
-    sock = clients.get(target_user_id)
-    if not sock:
-        return
-    try:
-        msg = f"{SERVER_USER_ID}|{json.dumps(payload, separators=(',', ':'))}"
-        sock.sendall(msg.encode("utf-8"))
-    except Exception:
-        try:
-            sock.close()
-        finally:
-            clients.pop(target_user_id, None)
-            client_rsa_pubs.pop(target_user_id, None)
-
-
-def _encrypt_bytes_for_client(plain: bytes, rsa_pub) -> dict:
-    """Hybrid encrypt: RSA-OAEP encrypts a random AES key, AES-GCM encrypts the data."""
-    aes_key = secrets.token_bytes(32)
-    aesgcm = AESGCM(aes_key)
-    nonce = secrets.token_bytes(12)
-    ct = aesgcm.encrypt(nonce, plain, None)
-    ek = rsa_pub.encrypt(
-        aes_key,
-        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
-    )
-    return {
-        "ek": base64.b64encode(ek).decode("ascii"),
-        "nonce": base64.b64encode(nonce).decode("ascii"),
-        "ct": base64.b64encode(ct).decode("ascii"),
-    }
-
-
-def _handle_server_command(sender_id: str, payload: dict):
-    """Handle messages addressed to __server__ for OTP-Lite and key registration."""
-    if not isinstance(payload, dict):
-        _send_system_message(sender_id, {"t": "ERROR", "msg": "Invalid server command payload."})
-        return
-
-    t = payload.get("t")
-
-    # Client registers RSA public key for OTP-Lite delivery.
-    if t == "REGISTER_KEYS":
-        rsa_pub_b64 = payload.get("rsa_pub")
-        if not rsa_pub_b64:
-            _send_system_message(sender_id, {"t": "ERROR", "msg": "Missing rsa_pub."})
-            return
-        try:
-            pem = base64.b64decode(rsa_pub_b64.encode("ascii"))
-            pub = serialization.load_pem_public_key(pem)
-            client_rsa_pubs[sender_id] = pub
-            _send_system_message(sender_id, {"t": "KEYS_OK"})
-        except Exception as e:
-            _send_system_message(sender_id, {"t": "ERROR", "msg": f"Failed to register keys: {e}"})
-        return
-
-    # OTP-Lite request: server generates a one-time pad for a single message.
-    if t == "OTPLITE_REQUEST":
-        to_user = payload.get("to")
-        msg_id = payload.get("msg_id")
-        length = payload.get("length")
-
-        if not to_user or not msg_id or not isinstance(length, int) or length <= 0:
-            _send_system_message(sender_id, {"t": "ERROR", "msg": "Invalid OTPLITE_REQUEST."})
-            return
-
-        if length > MAX_OTPLITE_LEN:
-            _send_system_message(sender_id, {"t": "ERROR", "msg": f"OTP-Lite message too long (max {MAX_OTPLITE_LEN} bytes). Use AES for longer messages."})
-            return
-
-        if to_user not in clients:
-            _send_system_message(sender_id, {"t": "ERROR", "msg": f"Recipient '{to_user}' not connected."})
-            return
-
-        sender_pub = client_rsa_pubs.get(sender_id)
-        recipient_pub = client_rsa_pubs.get(to_user)
-        if not sender_pub or not recipient_pub:
-            _send_system_message(
-                sender_id,
-                {"t": "ERROR", "msg": "OTP-Lite requires both clients to have registered RSA keys."},
-            )
-            return
-
-        # Generate pseudorandom pad bytes (OTP-Lite) and deliver it encrypted to both clients.
-        pad_bytes = secrets.token_bytes(length)
-        try:
-            sender_pack = _encrypt_bytes_for_client(pad_bytes, sender_pub)
-            recipient_pack = _encrypt_bytes_for_client(pad_bytes, recipient_pub)
-
-            common = {"t": "OTPLITE_PAD", "msg_id": msg_id, "from": sender_id, "to": to_user, "length": length}
-            _send_system_message(sender_id, {**common, **sender_pack})
-            _send_system_message(to_user, {**common, **recipient_pack})
-        finally:
-            # Ensure pad isn't kept server-side.
-            pad_bytes = None
-        return
-
-    _send_system_message(sender_id, {"t": "ERROR", "msg": f"Unknown server command: {t}"})
+clients = {}  
 
 class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
@@ -161,26 +38,17 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                 message = data.decode("utf-8")
 
                 try:
-                    recipient_id, payload_str = message.split("|", 1)
+                    recipient_id, encrypted_message = message.split("|", 1)
+                    print(f"Received message for '{recipient_id}' from '{user_id}': {encrypted_message}")
+                    send_message_to_recipient(recipient_id, encrypted_message, user_id)
                 except ValueError:
                     client_socket.sendall("Invalid message format.".encode("utf-8"))
-                    continue
-
-                # Messages addressed to __server__ are commands (key registration, OTP-Lite pad requests).
-                if recipient_id == SERVER_USER_ID:
-                    payload = _safe_json_loads(payload_str)
-                    _handle_server_command(user_id, payload)
-                    continue
-
-                print(f"Received message for '{recipient_id}' from '{user_id}': {payload_str}")
-                send_message_to_recipient(recipient_id, payload_str, user_id)
 
         except Exception as e:
             print(f"Error handling client {self.client_address}: {e}")
         finally:
             if user_id and user_id in clients:
                 del clients[user_id]
-                client_rsa_pubs.pop(user_id, None)
                 print(f"User '{user_id}' disconnected.")
             client_socket.close()
 
@@ -194,7 +62,6 @@ def send_message_to_recipient(recipient_id, message, sender_id):
         except Exception as e:
             print(f"Failed to send message to '{recipient_id}': {e}")
             del clients[recipient_id]
-            client_rsa_pubs.pop(recipient_id, None)
             recipient_socket.close()
     else:
         #Notify the sender that the recipient doesn't exist
@@ -211,7 +78,7 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 class ServerGUI:
     def __init__(self, master):
         self.master = master
-        self.master.title("OTP Server GUI (v1.5)")
+        self.master.title("OTP Server GUI")
 
         self.HOST = "0.0.0.0"
         self.PORT = 65432
