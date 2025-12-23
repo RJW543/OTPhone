@@ -1,0 +1,15 @@
+# Install all Python dependencies (these work fine from pip)
+pip3 install speech_recognition pyttsx3 pyngrok pycryptodome
+
+# Install Bluetooth from system packages (NOT pip)
+sudo apt-get install -y bluetooth bluez libbluetooth-dev python3-bluez
+
+# Install audio dependencies for voice features
+sudo apt-get install -y espeak python3-pyaudio portaudio19-dev
+
+# Start Bluetooth
+sudo systemctl start bluetooth
+sudo systemctl enable bluetooth
+
+# Add user to bluetooth group for permissions
+sudo usermod -a -G bluetooth $USER
